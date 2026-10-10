@@ -1150,6 +1150,14 @@ static void case_list_direct_latency(void)
     handle_server_json("{\"op\":\"lobby_list\",\"lobbies\":[]}");
     ck(!g_list_probe_armed, "an answered request disarms: the next push probes nothing");
     ck(!g_lp[0].used, "a room that left the list forgets its figure");
+    snprintf(g_lc.join.last_error, sizeof(g_lc.join.last_error), "%s", "");
+    g_lp[1].used = 1;
+    g_lp[1].state = LP_QUEUED;
+    handle_server_json("{\"op\":\"error\",\"code\":\"unknown_op\","
+                       "\"detail\":\"probe_signal\",\"ok\":false}");
+    ck(g_lc.join.last_error[0] == '\0', "an older server's unknown_op is not a join error");
+    ck(g_list_probe_unsupported && g_lp[1].state == LP_DONE,
+       "and stops probing on that connection");
     list_probe_reset();
     g_srv_rtt_ms = -1;
 }

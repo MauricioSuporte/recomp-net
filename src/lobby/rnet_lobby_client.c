@@ -443,6 +443,7 @@ static ListProbe g_lp[RNET_LOBBY_MAX_LIST];
 static ListAnswer g_la[LIST_ANSWER_MAX];
 static int g_list_probe_armed;
 static int g_list_probe_gen;
+static int g_list_probe_unsupported; /* this connection's server refused the op */
 
 static int list_probe_send(const char *lobby_id, const char *to, int gen,
                            const RNetSignal *msg)
@@ -524,6 +525,17 @@ static void list_probe_reset(void)
         if (g_la[i].used)
             list_answer_free(&g_la[i]);
     g_list_probe_armed = 0;
+    g_list_probe_unsupported = 0;
+}
+
+/* Stop every probe in flight; keep any figures already measured. */
+static void list_probe_unsupported(void)
+{
+    int i;
+    g_list_probe_unsupported = 1;
+    for (i = 0; i < RNET_LOBBY_MAX_LIST; ++i)
+        if (g_lp[i].used && (g_lp[i].state == LP_QUEUED || g_lp[i].state == LP_RUNNING))
+            list_probe_finish(&g_lp[i]);
 }
 
 static ListProbe *list_probe_find(const char *lobby_id)
@@ -555,7 +567,7 @@ static void list_probe_on_list(void)
             memset(&g_lp[i], 0, sizeof(g_lp[i]));
         }
     }
-    if (!armed || !rnet_host_ice_available())
+    if (!armed || g_list_probe_unsupported || !rnet_host_ice_available())
         return;
     for (j = 0; j < g_lc.list_count; ++j) {
         const RNetLobbyRow *row = &g_lc.list[j];
@@ -3346,6 +3358,15 @@ static void handle_server_json(const char *json)
         return;
     }
     if (strcmp(op, "error") == 0) {
+        char detail[32];
+        detail[0] = '\0';
+        json_get_str(json, "detail", detail, sizeof(detail));
+        if (strcmp(detail, "probe_signal") == 0) {
+            /* A server that predates the list probe: not a join failure, and
+             * not worth asking again on this connection. The estimate stands. */
+            list_probe_unsupported();
+            return;
+        }
         json_get_str(json, "code", g_lc.join.last_error, sizeof(g_lc.join.last_error));
         /* An automatch refusal arrives as a plain error, so it has to be
          * claimed here or it would be filed as a join failure and the queue
