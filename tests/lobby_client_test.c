@@ -1117,6 +1117,51 @@ static void case_list_latency_estimate(void)
     ck(rnet_lobby_list_latency_estimate_ms(2) == -1, "out of range is unknown");
 }
 
+static void case_list_direct_latency(void)
+{
+    static const char *list_json =
+        "{\"op\":\"lobby_list\",\"lobbies\":["
+        "{\"lobby_id\":\"A\",\"name\":\"Open\",\"game_name\":\"G\",\"player_count\":1,"
+        "\"max_slots\":2,\"host_rtt_ms\":12},"
+        "{\"lobby_id\":\"P\",\"name\":\"Locked\",\"game_name\":\"G\",\"player_count\":1,"
+        "\"max_slots\":2,\"has_password\":true,\"host_rtt_ms\":30}]}";
+    int direct = -1;
+    printf("  room list latency: the direct probe's figure, else the estimate\n");
+    memset(&g_lc, 0, sizeof(g_lc));
+    list_probe_reset();
+    g_lc.connected = 1;
+    g_srv_rtt_ms = 20;
+    handle_server_json(list_json);
+    ck(rnet_lobby_list_latency_ms(0, &direct) == 32 && direct == 0,
+       "before a probe lands, the estimate stands in (marked as one)");
+    /* What list_probe_finish leaves behind for room A. */
+    g_lp[0].used = 1;
+    g_lp[0].state = LP_DONE;
+    g_lp[0].rtt_ms = 3;
+    snprintf(g_lp[0].lobby_id, sizeof(g_lp[0].lobby_id), "%s", "A");
+    ck(rnet_lobby_list_latency_ms(0, &direct) == 3 && direct == 1, "a measured room reads direct");
+    ck(rnet_lobby_list_latency_ms(1, &direct) == 50 && direct == 0,
+       "a password room is never probed and keeps the estimate");
+    ck(rnet_lobby_list_latency_ms(1, NULL) == 50, "is_direct may be NULL");
+    handle_server_json(list_json);
+    ck(rnet_lobby_list_latency_ms(0, NULL) == 3,
+       "the server's own list push keeps the measurement (no re-probe)");
+    g_list_probe_armed = 1;
+    handle_server_json("{\"op\":\"lobby_list\",\"lobbies\":[]}");
+    ck(!g_list_probe_armed, "an answered request disarms: the next push probes nothing");
+    ck(!g_lp[0].used, "a room that left the list forgets its figure");
+    snprintf(g_lc.join.last_error, sizeof(g_lc.join.last_error), "%s", "");
+    g_lp[1].used = 1;
+    g_lp[1].state = LP_QUEUED;
+    handle_server_json("{\"op\":\"error\",\"code\":\"unknown_op\","
+                       "\"detail\":\"probe_signal\",\"ok\":false}");
+    ck(g_lc.join.last_error[0] == '\0', "an older server's unknown_op is not a join error");
+    ck(g_list_probe_unsupported && g_lp[1].state == LP_DONE,
+       "and stops probing on that connection");
+    list_probe_reset();
+    g_srv_rtt_ms = -1;
+}
+
 static void case_ice_launch_with_equal_endpoints_stays_ice(void)
 {
     printf("  an ICE launch with equal endpoints stays ICE\n");
@@ -1744,6 +1789,7 @@ int main(void)
     case_launch_transport_survives_a_lobby_update();
     case_ice_launch_with_equal_endpoints_stays_ice();
     case_list_latency_estimate();
+    case_list_direct_latency();
     case_gallery_does_not_rearm_ready();
     case_chat_ring_keeps_room_order();
     case_chat_ring_wraps_oldest_first();
