@@ -307,6 +307,15 @@ endif()
 if(RNET_BUILD_TESTS)
   enable_testing()
 
+  find_package(Python3 QUIET COMPONENTS Interpreter)
+  if(Python3_Interpreter_FOUND)
+    add_executable(auth_startup_probe tests/auth_startup_probe.c)
+    target_link_libraries(auth_startup_probe PRIVATE recomp_net)
+    add_test(NAME auth_startup_test COMMAND "${Python3_EXECUTABLE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/auth_startup_test.py"
+      --probe "$<TARGET_FILE:auth_startup_probe>")
+  endif()
+
   # Every function a public header declares links against recomp_net.
   include(RnetApiLinkTest)
   rnet_add_api_link_test()
