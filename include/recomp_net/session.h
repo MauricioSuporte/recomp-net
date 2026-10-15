@@ -468,6 +468,10 @@ void rnet_session_clear_remote_inputs(RNetSession *s);
  * Needed when one UDP commit is lost and the hash-chain frontier has only
  * its local half. No episode or input row is changed by this request. */
 #define RNET_RB_SYNC_OP_FRAME_COMMIT_REQUEST 6u
+/* Immutable execution startup barrier (startup_profiles.h). Reserved by the
+ * session; never forwarded to the episode driver's RB_SYNC receive queue. */
+#define RNET_RB_SYNC_OP_PROFILE_OFFER 7u
+#define RNET_RB_SYNC_OP_PROFILE_ACK 8u
 
 /* RB_SYNC flags (BEGIN): initiator-authoritative episode attributes the
  * follower must adopt verbatim so both peers run the same episode shape. */
