@@ -1,4 +1,5 @@
 #include "recomp_net/recomp_net.h"
+#include "recomp_net/startup_profiles.h"
 
 #include "ice/rnet_ice_internal.h"
 #include "input/rnet_rings.h"
@@ -87,6 +88,16 @@ typedef struct RNetIceHubBridge
 
 struct RNetSession
 {
+    /* Fixed startup agreement. Reserved RB_SYNC ops are consumed here, never
+     * by the rollback driver's episode queue. Kept across rollback/resync. */
+    struct {
+        int active, refused;
+        rnet_u32 qualification, occupied, offers, acks, acknowledged_by;
+        rnet_u32 selected, transcript;
+        RNetProfileCaps caps[RNET_MAX_SLOTS];
+        rnet_u64 last_tx;
+        int dirty;
+    } profiles;
     RNetConfig cfg;
     RNetHostVTable host;
     RNetTransport transport;
@@ -377,6 +388,149 @@ static void note_admit_ok(RNetSession *s)
 }
 
 static void send_raw(RNetSession *s, const rnet_u8 *buf, int len);
+
+/* Additive RB_SYNC startup ops, deliberately separate from episode state.
+ * Offers are copied once. Retries do not observe or change host capabilities. */
+#define PROFILE_OFFER RNET_RB_SYNC_OP_PROFILE_OFFER
+#define PROFILE_ACK RNET_RB_SYNC_OP_PROFILE_ACK
+
+static rnet_u32 profile_fold(rnet_u32 h, rnet_u32 word)
+{
+    int byte;
+    for (byte = 0; byte < 4; ++byte) {
+        h = (h ^ (word & 255u)) * 16777619u;
+        word >>= 8;
+    }
+    return h;
+}
+
+static void profiles_choose(RNetSession *s)
+{
+    rnet_u32 common = ~(rnet_u32)0, h = 2166136261u;
+    int i;
+    if (s->profiles.offers != s->profiles.occupied || s->profiles.acks) return;
+    h = profile_fold(h, s->profiles.qualification);
+    h = profile_fold(h, s->cfg.slot_count);
+    h = profile_fold(h, s->profiles.occupied);
+    for (i = 0; i < s->cfg.slot_count; ++i) {
+        const RNetProfileCaps *c = &s->profiles.caps[i];
+        if (!(s->profiles.occupied & (1u << i))) continue;
+        common &= c->profiles;
+        h = profile_fold(h, (rnet_u32)i);
+        h = profile_fold(h, c->cpu_features);
+        h = profile_fold(h, c->backends);
+        h = profile_fold(h, c->profiles);
+        h = profile_fold(h, c->architecture);
+    }
+    if (!(common & 1u)) { s->profiles.refused = 1; return; }
+    for (i = 31; i > 0 && !(common & (1u << i)); --i) {}
+    s->profiles.selected = (rnet_u32)i;
+    s->profiles.transcript = profile_fold(h, (rnet_u32)i);
+    s->profiles.acks = 1u << s->cfg.local_slot;
+    s->profiles.acknowledged_by = s->profiles.acks;
+    s->profiles.dirty = 1;
+}
+
+static void profiles_receive(RNetSession *s, const RNetDecodedPacket *p)
+{
+    rnet_u32 bit;
+    if (!s->profiles.active || s->profiles.refused ||
+        p->local_slot >= s->cfg.slot_count || p->local_slot == s->cfg.local_slot)
+        return;
+    bit = 1u << p->local_slot;
+    if (!(s->profiles.occupied & bit)) return;
+    if (p->rb_epoch_id != s->profiles.qualification || p->rb_flags != 0u) {
+        s->profiles.refused = 1;
+        return;
+    }
+    if (p->rb_initiator == PROFILE_OFFER) {
+        RNetProfileCaps caps;
+        caps.cpu_features = p->rb_mismatch_tick;
+        caps.backends = p->rb_load_tick;
+        caps.profiles = p->rb_target_tick;
+        caps.architecture = p->rb_corrected_slot;
+        if (!(caps.profiles & 1u) || ((s->profiles.offers & bit) &&
+            memcmp(&caps, &s->profiles.caps[p->local_slot], sizeof(caps)) != 0)) {
+            s->profiles.refused = 1; /* changed offer: never renegotiate */
+            return;
+        }
+        s->profiles.caps[p->local_slot] = caps;
+        s->profiles.offers |= bit;
+        profiles_choose(s);
+    } else if (s->profiles.offers == s->profiles.occupied) {
+        if (p->rb_mismatch_tick != s->profiles.selected ||
+            p->rb_load_tick != s->profiles.transcript ||
+            p->rb_corrected_slot != 0u ||
+            !(p->rb_target_tick & bit) ||
+            (p->rb_target_tick & ~s->profiles.occupied)) {
+            s->profiles.refused = 1;
+            return;
+        }
+        if (!(s->profiles.acks & bit)) s->profiles.dirty = 1;
+        s->profiles.acks |= bit;
+        if (p->rb_target_tick & (1u << s->cfg.local_slot))
+            s->profiles.acknowledged_by |= bit;
+    }
+}
+
+static void profiles_drive(RNetSession *s)
+{
+    rnet_u64 now;
+    const RNetProfileCaps *c;
+    if (!s->profiles.active || s->profiles.refused || s->phase != RNET_PHASE_RUNNING)
+        return;
+    if (!s->profiles.dirty && s->profiles.acknowledged_by == s->profiles.occupied)
+        return;
+    now = session_now(s);
+    if (!s->profiles.dirty && s->profiles.last_tx && now - s->profiles.last_tx < 100u)
+        return;
+    c = &s->profiles.caps[s->cfg.local_slot];
+    rnet_session_send_rb_sync(s, s->profiles.qualification, c->cpu_features,
+        c->backends, c->profiles, (rnet_u8)c->architecture, PROFILE_OFFER, 0u);
+    if (s->profiles.acks)
+        rnet_session_send_rb_sync(s, s->profiles.qualification, s->profiles.selected,
+            s->profiles.transcript, s->profiles.acks, 0u, PROFILE_ACK, 0u);
+    s->profiles.last_tx = now ? now : 1u;
+    s->profiles.dirty = 0;
+}
+
+int rnet_session_profiles_begin(RNetSession *s, rnet_u32 qualification,
+                                const RNetProfileCaps *caps)
+{
+    int i;
+    if (!s || !caps || !qualification || !(caps->profiles & 1u) ||
+        caps->architecture > 255u || s->is_observer || s->profiles.active ||
+        !rnet_config_slot_occupied(&s->cfg, s->cfg.local_slot) ||
+        s->phase != RNET_PHASE_IDLE || s->sim_tick != 0u) return -1;
+    for (i = 0; i < s->cfg.slot_count; ++i)
+        if (rnet_config_slot_occupied(&s->cfg, (rnet_u8)i))
+            s->profiles.occupied |= 1u << i;
+    s->profiles.active = 1;
+    s->profiles.qualification = qualification;
+    s->profiles.caps[s->cfg.local_slot] = *caps;
+    s->profiles.offers = 1u << s->cfg.local_slot;
+    s->profiles.dirty = 1;
+    profiles_choose(s);
+    return 0;
+}
+
+int rnet_session_profiles_status(const RNetSession *s, rnet_u32 *profile,
+                                 rnet_u32 *transcript)
+{
+    if (!s || !s->profiles.active || s->profiles.refused) return -1;
+    if (s->profiles.acks != s->profiles.occupied) return 0;
+    if (profile) *profile = s->profiles.selected;
+    if (transcript) *transcript = s->profiles.transcript;
+    return 1;
+}
+
+int rnet_session_profiles_peer(const RNetSession *s, int seat, RNetProfileCaps *out)
+{
+    if (!s || !out || seat < 0 || seat >= s->cfg.slot_count ||
+        !(s->profiles.offers & (1u << seat))) return 0;
+    *out = s->profiles.caps[seat];
+    return 1;
+}
 
 /* An episode-control queue was full, so this datagram is refused. Said out
  * loud: the first one and every 64th after, so a storm cannot flood the log
@@ -863,6 +1017,11 @@ static void handle_decoded(RNetSession *s, const RNetDecodedPacket *pkt)
         }
         break;
     case RNET_PKT_RB_SYNC:
+        if (pkt->rb_initiator == PROFILE_OFFER || pkt->rb_initiator == PROFILE_ACK)
+        {
+            profiles_receive(s, pkt);
+            break;
+        }
         if (s->rb_peer_slot >= 0 && (int)pkt->local_slot != s->rb_peer_slot)
         {
             break;
@@ -3048,6 +3207,7 @@ void rnet_session_pump(RNetSession *s)
     }
     pump_recv(s);
     maybe_bootstrap(s);
+    profiles_drive(s);
     if (s->state_probe_active)
     {
         state_drive_probe(s);
@@ -3130,6 +3290,11 @@ int rnet_session_try_admit(RNetSession *s, rnet_u32 sim_tick)
     {
         if (s)
             note_admit_stall(s, RNET_ADMIT_NOT_RUNNING);
+        return 0;
+    }
+    if (s->profiles.active && rnet_session_profiles_status(s, NULL, NULL) != 1)
+    {
+        note_admit_stall(s, RNET_ADMIT_NOT_RUNNING);
         return 0;
     }
     if (s->state_stall_sim && (state_any_active(s) || s->state_probe_active))

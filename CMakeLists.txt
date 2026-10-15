@@ -425,6 +425,12 @@ if(RNET_BUILD_TESTS)
   add_test(NAME stun_test COMMAND stun_test)
 
   add_executable(session_state_test tests/session_state_test.c)
+  add_executable(startup_profiles_test tests/startup_profiles_test.c)
+  target_link_libraries(startup_profiles_test PRIVATE recomp_net)
+  add_test(NAME startup_profiles_test COMMAND startup_profiles_test)
+  add_test(NAME startup_profiles_loss_test COMMAND startup_profiles_test)
+  set_tests_properties(startup_profiles_loss_test PROPERTIES
+    ENVIRONMENT "RNET_SIM_LOSS_PCT=30;RNET_SIM_LATENCY_MS=2;RNET_SIM_JITTER_MS=1;RNET_SIM_SEED=42")
   # The multi-seat cases drive a lossy relay built on the internal transport.
   target_include_directories(session_state_test PRIVATE src)
   target_link_libraries(session_state_test PRIVATE recomp_net)

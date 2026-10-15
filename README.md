@@ -12,6 +12,8 @@ vendor SSB64 code and does not implement rollback, automatch, or game UI.
 
 - Opaque per-slot input blobs (`RNetInputSample`)
 - Fixed input delay `D` with `try_admit` / `advance` host loop
+- Optional [fixed startup profile agreement](docs/startup-profiles.md) from
+  actual capabilities and qualified profiles, with a common portable fallback
 - UDP LAN transport and optional ICE mux
 - Portable, ranked local IPv4 interface discovery for LAN launchers
 - Synchronous RFC 5389 external IPv4 discovery through configurable STUN
