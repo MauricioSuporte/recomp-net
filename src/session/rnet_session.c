@@ -156,7 +156,7 @@ struct RNetSession
     rnet_u32 desync_local_hash;
     rnet_u32 desync_remote_hash;
     /* Peer liveness. Aggregate: any valid packet stamps last_peer_rx_ms and a
-     * BYE from anyone sets peer_gone -- the two-seat view, kept as it was.
+     * BYE from any player seat sets peer_gone (a spectator's does not).
      * Per seat: the same two facts indexed by the packet's sender slot, so a
      * seat that went silent in a room of four is visible instead of hiding
      * behind the others' traffic. Indexed by wire slot; seats are < 8. */
@@ -926,8 +926,14 @@ static void handle_decoded(RNetSession *s, const RNetDecodedPacket *pkt)
     case RNET_PKT_BYE:
         if (pkt->local_slot != s->wire_slot)
         {
-            /* Aggregate: any peer's BYE, as before. Per seat: who said it. */
-            s->peer_gone = 1;
+            /* Aggregate: a PLAYER's BYE ends the match, as before. Per seat:
+             * who said it. A spectator sends from a gallery wire slot at or
+             * past the seats (relay base + index); its BYE says only that a
+             * watcher closed the game, and must not stop the players. */
+            if (pkt->local_slot < s->cfg.slot_count)
+            {
+                s->peer_gone = 1;
+            }
             if (pkt->local_slot < RNET_MAX_SLOTS)
             {
                 s->peer_gone_mask |= 1u << pkt->local_slot;

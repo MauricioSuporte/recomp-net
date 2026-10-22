@@ -1435,7 +1435,25 @@ static void multi_seat_observer_test(void)
     if (rnet_session_disconnected_peers(host, 100) != 0u)
         fail("observer: an observer must never read as a disconnected seat");
     (void)room_drive(&r, 20);
-    printf("session_state_test: 2 seats + observer: ACK/reply filtering %s\n",
+    /* The spectator closes its game: its BYE (gallery wire slot) must not end
+     * the match for the players; a player's BYE still does. */
+    if (rnet_session_send_bye(obs) != 0)
+        fail("observer: bye");
+    for (i = 0; i < 20; ++i)
+        room_pump(&r);
+    if (rnet_session_peer_disconnected(host, 0) || rnet_session_peer_disconnected(seat, 0))
+        fail("observer: a spectator's BYE ended the players' match");
+    if (rnet_session_peer_gone(host, 1))
+        fail("observer: a spectator's BYE was read as the seat's");
+    if (rnet_session_send_bye(seat) != 0)
+        fail("observer: seat bye");
+    for (i = 0; i < 20; ++i)
+        room_pump(&r);
+    if (!rnet_session_peer_disconnected(host, 0) || !rnet_session_peer_gone(host, 1))
+        fail("observer: a player's BYE must still end the match");
+    if (!rnet_session_peer_disconnected(obs, 0))
+        fail("observer: the spectator must see the player leave");
+    printf("session_state_test: 2 seats + observer: ACK/reply filtering, spectator BYE %s\n",
            g_failures != failures_before ? "FAILED" : "ok");
 out:
     room_close(&r);
