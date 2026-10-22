@@ -126,6 +126,10 @@ struct RNetSession
     /* Host authority: the last input each seat contributed (repeated when
      * nothing newer has arrived). */
     RNetInputSample auth_last[RNET_MAX_SLOTS];
+    /* Host authority diagnostics: rows refused by the live window (a guest
+     * further behind than one ring) and old rows resent from a peer's ACK. */
+    rnet_u32 auth_rows_dropped;
+    rnet_u32 auth_resend_rows;
     rnet_u32 peer_ack_tick[RNET_MAX_SLOTS];
     rnet_u8 peer_ack_seen[RNET_MAX_SLOTS];
     rnet_u64 last_hello_ms;
@@ -632,10 +636,33 @@ static int remote_tick_in_live_window(const RNetSession *s, rnet_u8 slot, rnet_u
          * latency, so the host's rows arrive well ahead of a guest's tip and
          * a guest's inputs well behind the host's. Accept half the ring each
          * way; the ring itself bounds what can be stored. */
-        rnet_u32 half = (rnet_u32)RNET_HISTORY_LENGTH / 2u;
-        lo = (s->sim_tick > half) ? (s->sim_tick - half) : 0u;
-        hi = s->sim_tick + half;
-        return tick >= lo && tick <= hi;
+        rnet_u32 span = (rnet_u32)RNET_HISTORY_LENGTH - 1u;
+        (void)tip;
+        if (s->cfg.local_slot != 0 && slot == 0)
+        {
+            /* A guest needs every host row from its own sim tick on and
+             * nothing older (those were already played). Accept the whole
+             * ring forward of it: a guest that fell behind by a hiccup can
+             * then take the host's resends and catch up instead of dropping
+             * them forever (the old +/- half window froze the guest for good
+             * once it was more than 64 rows behind). The window is exactly
+             * one ring long, so a late retransmit of a played row can never
+             * overwrite a future row that shares its ring slot. */
+            if (tick < s->sim_tick)
+                return 0; /* already played: an ordinary late retransmit */
+            if (tick <= s->sim_tick + span)
+                return 1;
+            ((RNetSession *)s)->auth_rows_dropped++;
+            return 0;
+        }
+        /* The host only ever folds in each guest's NEWEST input, which trails
+         * the host by that guest's backlog. Accept a ring's worth behind. */
+        lo = (s->sim_tick > span - 16u) ? (s->sim_tick - (span - 16u)) : 0u;
+        hi = s->sim_tick + 16u + (rnet_u32)s->delay;
+        if (tick >= lo && tick <= hi)
+            return 1;
+        ((RNetSession *)s)->auth_rows_dropped++;
+        return 0;
     }
     slop = (rnet_u32)s->cfg.bundle_redundancy + 8u;
     if (slop < 8u)
@@ -696,7 +723,11 @@ static void store_remote_frame(RNetSession *s, rnet_u8 slot, const RNetWireFrame
     }
     sample.valid = 1;
     rnet_ring_store(&s->remote_rings[slot], &sample);
-    if (s->cfg.slot_count > 2)
+    /* Host authority also needs the contiguous mark with two seats: a guest
+     * acknowledges the host's rows by it, so a lost row is resent instead of
+     * being covered by a later row's "highest seen" ACK (that froze a LAN
+     * guest on the first lost datagram older than the redundancy window). */
+    if (s->cfg.slot_count > 2 || s->cfg.host_authority)
     {
         rnet_u32 next = s->remote_contiguous_ack[slot] + 1u;
         while (rnet_ring_get(&s->remote_rings[slot], next, &existing))
@@ -878,6 +909,18 @@ static void handle_decoded(RNetSession *s, const RNetDecodedPacket *pkt)
             {
                 s->peer_ack_tick[pkt->local_slot] = ack;
                 s->peer_ack_seen[pkt->local_slot] = 1;
+            }
+        }
+        else if (s->cfg.slot_count == 2 && s->cfg.host_authority &&
+                 s->cfg.local_slot == 0)
+        {
+            /* Contiguous ACK from a host-authority guest; 0xffffffff means
+             * it has not received row 0 yet. */
+            if (pkt->ack_tick != 0xffffffffu &&
+                (!s->peer_ack_seen[1] || pkt->ack_tick > s->highest_remote_ack))
+            {
+                s->highest_remote_ack = pkt->ack_tick;
+                s->peer_ack_seen[1] = 1;
             }
         }
         else if (s->cfg.slot_count == 2 && pkt->ack_tick > s->highest_remote_ack)
@@ -2392,6 +2435,26 @@ static void maybe_bootstrap(RNetSession *s)
     }
 }
 
+/* Test knob: RNET_TEST_INPUT_LOSS_PCT=<0..90> drops that share of outgoing
+ * INPUT datagrams (deterministic LCG), to exercise resend/catch-up paths on
+ * loopback. Unset in normal play. */
+static int test_input_loss_drop(void)
+{
+    static int pct = -1;
+    static rnet_u32 lcg = 0x2545f491u;
+    if (pct < 0)
+    {
+        const char *v = getenv("RNET_TEST_INPUT_LOSS_PCT");
+        pct = v ? atoi(v) : 0;
+        if (pct < 0) pct = 0;
+        if (pct > 90) pct = 90;
+    }
+    if (pct == 0)
+        return 0;
+    lcg = lcg * 1664525u + 1013904223u;
+    return (int)((lcg >> 16) % 100u) < pct;
+}
+
 static void send_input_bundle(RNetSession *s)
 {
     rnet_u8 buf[RNET_MAX_PACKET];
@@ -2455,6 +2518,11 @@ static void send_input_bundle(RNetSession *s)
         rnet_u32 max_back = (rnet_u32)RNET_HISTORY_LENGTH / 2u;
         if (max_back < 32u) max_back = 32u;
         if (max_back > 64u) max_back = 64u;
+        /* Host authority: the host's rows are the whole match for a guest,
+         * and a guest that hiccuped can trail by more than 64 rows. Resend
+         * everything the ring still holds past its ACK so it can catch up. */
+        if (s->cfg.host_authority && s->cfg.local_slot == 0)
+            max_back = (rnet_u32)RNET_HISTORY_LENGTH - 8u;
         for (slot = 0; slot < s->cfg.slot_count; ++slot)
         {
             rnet_u32 peer_lo;
@@ -2476,6 +2544,12 @@ static void send_input_bundle(RNetSession *s)
             max_back = 32U;
         if (max_back > 64U)
             max_back = 64U;
+        if (s->cfg.host_authority && s->cfg.local_slot == 0)
+        {
+            max_back = (rnet_u32)RNET_HISTORY_LENGTH - 8U;
+            if (!s->peer_ack_seen[1])
+                ack_lo = 0U; /* guest has not confirmed row 0 yet */
+        }
         if (tip + 1U > max_back && ack_lo + max_back <= tip)
             ack_lo = tip + 1U - max_back;
         if (ack_lo < lo)
@@ -2490,6 +2564,10 @@ static void send_input_bundle(RNetSession *s)
         &s->remote_rings[s->is_observer
                              ? 0
                              : ((s->cfg.local_slot + 1) % s->cfg.slot_count)]);
+    /* Host-authority guest: acknowledge the host's rows by contiguity, so
+     * the host resends from the first hole rather than past it. */
+    if (s->cfg.host_authority && s->cfg.local_slot != 0)
+        ack = s->remote_contiguous_ack[0];
     for (slot = 0; slot < s->cfg.slot_count; ++slot)
         ack_vector[slot] = s->remote_contiguous_ack[slot];
     t = lo;
@@ -2502,6 +2580,8 @@ static void send_input_bundle(RNetSession *s)
             RNetInputSample sample;
             if (rnet_ring_get(&s->local_ring, t, &sample))
             {
+                if (t + (rnet_u32)red <= tip)
+                    s->auth_resend_rows++;
                 frames[count].tick = sample.tick;
                 frames[count].size = sample.size;
                 memcpy(frames[count].bytes, sample.bytes, sample.size);
@@ -2529,7 +2609,8 @@ static void send_input_bundle(RNetSession *s)
         {
             break;
         }
-        send_raw(s, buf, len);
+        if (!test_input_loss_drop())
+            send_raw(s, buf, len);
         s->input_bundle_sends++;
         sent_any = 1;
     }
@@ -4076,6 +4157,33 @@ void rnet_session_get_stats(const RNetSession *s, RNetSessionStats *out)
     }
     out->highest_remote_wire = highest_remote;
     out->remote_lead = have_remote ? (int)highest_remote - (int)s->sim_tick : 0;
+    out->host_authority = s->cfg.host_authority ? 1 : 0;
+    out->auth_rows_dropped = s->auth_rows_dropped;
+    out->auth_resend_rows = s->auth_resend_rows;
+    out->auth_backlog = -1;
+    if (s->cfg.host_authority)
+    {
+        if (s->cfg.local_slot != 0)
+            out->auth_backlog = out->remote_lead;
+        else if (s->cfg.slot_count == 2)
+        {
+            if (s->peer_ack_seen[1])
+                out->auth_backlog = (int)s->sim_tick - (int)s->highest_remote_ack;
+        }
+        else
+        {
+            for (slot = 1; slot < s->cfg.slot_count; ++slot)
+            {
+                int lag;
+                if (!rnet_config_slot_occupied(&s->cfg, slot) || !s->peer_ack_seen[slot] ||
+                    s->peer_ack_tick[slot] == 0xffffffffu)
+                    continue;
+                lag = (int)s->sim_tick - (int)s->peer_ack_tick[slot];
+                if (lag > out->auth_backlog)
+                    out->auth_backlog = lag;
+            }
+        }
+    }
 
 #if defined(RNET_ENABLE_ICE)
     if (s->ice_hub_mask != 0u) {

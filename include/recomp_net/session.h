@@ -236,6 +236,14 @@ typedef struct RNetSessionStats
     rnet_u32 state_probe_reply_mask;  /* prober: seats that answered */
     rnet_u32 peer_gone_mask;          /* seats that sent BYE */
     rnet_u64 peer_rx_age_ms[RNET_MAX_SLOTS]; /* per seat; RNET_PEER_RX_NEVER if never */
+    /* Host authority (appended). */
+    int host_authority;
+    rnet_u32 auth_rows_dropped;  /* rows refused by the live window */
+    rnet_u32 auth_resend_rows;   /* rows resent from a peer's ACK (loss/backlog) */
+    /* Host: largest gap between its sim tick and a guest's contiguous ACK of
+     * the host's rows (how far that guest trails). Guest: its own backlog,
+     * the host's newest row minus its sim tick. -1 when unknown. */
+    int auth_backlog;
 } RNetSessionStats;
 
 void rnet_session_get_stats(const RNetSession *s, RNetSessionStats *out);

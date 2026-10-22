@@ -483,6 +483,10 @@ if(RNET_BUILD_TESTS)
   target_link_libraries(session_host_authority_test PRIVATE recomp_net)
   add_test(NAME session_host_authority_test COMMAND session_host_authority_test)
 
+  add_executable(session_host_authority_catchup_test tests/session_host_authority_catchup_test.c)
+  target_link_libraries(session_host_authority_catchup_test PRIVATE recomp_net)
+  add_test(NAME session_host_authority_catchup_test COMMAND session_host_authority_catchup_test)
+
   add_executable(rb_wire_test tests/rb_wire_test.c)
   target_link_libraries(rb_wire_test PRIVATE recomp_net)
   target_include_directories(rb_wire_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
