@@ -1760,6 +1760,50 @@ static void case_hostice_launch_without_agents_is_refused(void)
     g_lc.fd = -1;
 }
 
+/* A five-seat room whose members each offer a dozen-plus installed packages
+ * (Super Bomberman 5 ships 14) sends lobby_update frames well past 4 KiB.
+ * The frame buffer used to be 4 KiB: the third member's join filled it, the
+ * pump took a full buffer for a broken connection and dropped the lobby. */
+static void case_large_lobby_update_frame_fits(void)
+{
+    static char json[24000];
+    size_t o = 0, plen;
+    int seat, k;
+    printf("  a lobby_update past 4 KiB (5 members x 14 offered mods) is read whole\n");
+    memset(&g_lc, 0, sizeof(g_lc));
+    snprintf(g_lc.player_id, sizeof(g_lc.player_id), "%s", "p0");
+    g_lc.connected = 1;
+    g_lc.handshake_done = 1;
+    o += (size_t)snprintf(json + o, sizeof(json) - o,
+        "{\"op\":\"lobby_update\",\"lobby_id\":\"L\",\"player_count\":5,"
+        "\"max_slots\":5,\"host_endpoint\":\"relay.example:8777\","
+        "\"match_caps\":{\"v\":1,\"input_delay\":4},\"slots\":[");
+    for (seat = 0; seat < 5; ++seat) {
+        o += (size_t)snprintf(json + o, sizeof(json) - o,
+            "%s{\"slot\":%d,\"player_id\":\"p%d\",\"display_name\":\"Player %d\","
+            "\"mod_offer\":{\"pkgs\":[", seat ? "," : "", seat, seat, seat);
+        for (k = 0; k < 14; ++k)
+            o += (size_t)snprintf(json + o, sizeof(json) - o,
+                "%s{\"id\":\"superbomberman5.package-number-%02d\",\"ver\":\"0.1.0\","
+                "\"n\":\"\",\"f\":\"\"}", k ? "," : "", k);
+        o += (size_t)snprintf(json + o, sizeof(json) - o, "]}}");
+    }
+    o += (size_t)snprintf(json + o, sizeof(json) - o, "]}");
+    plen = o;
+    ck(plen > 4096 && plen < 65535, "the frame is past the old 4 KiB buffer");
+    ck(plen + 4 <= sizeof(g_lc.ws_pending), "and fits the frame buffer whole");
+    g_lc.ws_pending[0] = 0x81;               /* FIN + text */
+    g_lc.ws_pending[1] = 126;                /* 16-bit length */
+    g_lc.ws_pending[2] = (uint8_t)(plen >> 8);
+    g_lc.ws_pending[3] = (uint8_t)(plen & 0xff);
+    memcpy(g_lc.ws_pending + 4, json, plen);
+    g_lc.ws_pending_len = plen + 4;
+    drain_ws_pending();
+    ck(g_lc.ws_pending_len == 0, "the frame was consumed");
+    ck(g_lc.connected == 1, "and the lobby connection is still up");
+    ck(g_lc.member_count == 5, "all five members were read");
+}
+
 int main(void)
 {
     case_rows();
@@ -1787,6 +1831,7 @@ int main(void)
     case_gallery_seat_addressing();
     case_the_gallery_does_not_negotiate();
     case_launch_transport_survives_a_lobby_update();
+    case_large_lobby_update_frame_fits();
     case_ice_launch_with_equal_endpoints_stays_ice();
     case_list_latency_estimate();
     case_list_direct_latency();

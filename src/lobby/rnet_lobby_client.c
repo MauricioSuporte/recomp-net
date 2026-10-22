@@ -107,7 +107,12 @@ typedef struct {
     char rx_http[4096];
     size_t rx_http_len;
     /* Bytes that arrived with the HTTP 101 response after the header end. */
-    uint8_t ws_pending[4096];
+    /* One server frame must fit whole. A lobby_update repeats every member's
+     * mod offer (one row per installed package), so a title with a dozen
+     * packages passed 4 KiB at the third member: the buffer filled, the pump
+     * read that as a broken connection and dropped the lobby -- for the host,
+     * the room closed. 64 KiB covers RNET_LOBBY_MAX_MEMBERS full offers. */
+    uint8_t ws_pending[65536];
     size_t ws_pending_len;
     RNetLobbyRow list[RNET_LOBBY_MAX_LIST];
     int list_count;
@@ -2587,8 +2592,8 @@ static void drain_ws_pending(void)
         if (g_lc.ws_pending_len < i + plen) {
             return;
         }
-        if (opcode == 0x1 && plen + 1 < sizeof(g_lc.rx_http)) {
-            char text[4096];
+        if (opcode == 0x1 && plen + 1 < sizeof(g_lc.ws_pending)) {
+            static char text[sizeof(g_lc.ws_pending)];
             memcpy(text, g_lc.ws_pending + i, plen);
             text[plen] = '\0';
             handle_server_json(text);
