@@ -46,6 +46,17 @@ typedef struct RNetConfig
      * 4-max lobby) must clear empty bits so READY/admit do not wait forever
      * on a phantom remote. Empty seats use deterministic neutral samples. */
     rnet_u32 occupied_mask;
+    /* Host-authoritative delay-sync (0 = off, the classic lockstep).
+     *
+     * Every peer must agree. Seat 0 never waits: each tick it takes its own
+     * pad live and, for every other seat, the newest input that seat has sent
+     * (the previous one again if nothing new arrived), and sends the whole
+     * resolved row packed into its own input sample. Guests simulate only
+     * those rows, so all peers run the same inputs; a guest lags the host by
+     * its network latency instead of stalling everyone. Classic lockstep's
+     * per-tick confirmation barrier is not used. Needs
+     * 1 + slot_count * input_size <= RNET_INPUT_MAX; otherwise ignored. */
+    rnet_u8 host_authority;
 } RNetConfig;
 
 static inline void rnet_config_init_defaults(RNetConfig *cfg)

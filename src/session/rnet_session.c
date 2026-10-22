@@ -123,6 +123,9 @@ struct RNetSession
     /* Multi-seat INPUT carries one contiguous acknowledgment per source.
      * UINT32_MAX means the receiver has not yet seen tick zero. */
     rnet_u32 remote_contiguous_ack[RNET_MAX_SLOTS];
+    /* Host authority: the last input each seat contributed (repeated when
+     * nothing newer has arrived). */
+    RNetInputSample auth_last[RNET_MAX_SLOTS];
     rnet_u32 peer_ack_tick[RNET_MAX_SLOTS];
     rnet_u8 peer_ack_seen[RNET_MAX_SLOTS];
     rnet_u64 last_hello_ms;
@@ -623,6 +626,17 @@ static int remote_tick_in_live_window(const RNetSession *s, rnet_u8 slot, rnet_u
         return 1;
     }
     tip = rnet_wire_tick_from_sim(s->sim_tick, s->delay);
+    if (s->cfg.host_authority)
+    {
+        /* Peers are not in lockstep: a guest runs behind the host by its
+         * latency, so the host's rows arrive well ahead of a guest's tip and
+         * a guest's inputs well behind the host's. Accept half the ring each
+         * way; the ring itself bounds what can be stored. */
+        rnet_u32 half = (rnet_u32)RNET_HISTORY_LENGTH / 2u;
+        lo = (s->sim_tick > half) ? (s->sim_tick - half) : 0u;
+        hi = s->sim_tick + half;
+        return tick >= lo && tick <= hi;
+    }
     slop = (rnet_u32)s->cfg.bundle_redundancy + 8u;
     if (slop < 8u)
     {
@@ -2551,6 +2565,9 @@ static void seed_delay_prefix(RNetSession *s)
 {
     rnet_u32 t;
     if (s == NULL) return;
+    /* Host authority has no neutral prefix: seat 0's rows start at tick 0,
+     * and a neutral row sent first would win the guests' first-wins rings. */
+    if (s->cfg.host_authority) return;
     for (t = 0; t < (rnet_u32)s->delay; ++t)
     {
         RNetInputSample sample;
@@ -3276,6 +3293,97 @@ int rnet_session_wait_recv(RNetSession *s, int timeout_ms)
     return 0;
 }
 
+/* Host-authoritative admission (RNetConfig.host_authority). Seat 0 resolves
+ * every tick from what it already has and never waits; everyone else plays
+ * the rows it sends. Row layout in seat 0's sample: byte 0 = bytes per seat,
+ * then each seat's input in seat order. */
+static int try_admit_host_authority(RNetSession *s, rnet_u32 sim_tick)
+{
+    RNetInputSample resolved[RNET_MAX_SLOTS];
+    RNetInputSample sample;
+    rnet_u8 slot;
+    const rnet_u8 n = s->cfg.slot_count;
+
+    memset(resolved, 0, sizeof(resolved));
+    if (s->cfg.local_slot == 0)
+    {
+        RNetInputSample row;
+        rnet_u16 per;
+        memset(&sample, 0, sizeof(sample));
+        s->host.sample_local(sim_tick, &sample, s->host.ctx);
+        per = sample.size;
+        if (per == 0 || 1u + (unsigned)per * (unsigned)n > RNET_INPUT_MAX)
+            per = (rnet_u16)((RNET_INPUT_MAX - 1u) / (unsigned)n);
+        for (slot = 0; slot < n; ++slot)
+        {
+            if (slot == 0)
+                resolved[slot] = sample;
+            else if (rnet_config_slot_occupied(&s->cfg, slot))
+            {
+                RNetInputSample newest;
+                rnet_u32 hi = rnet_ring_highest_valid(&s->remote_rings[slot]);
+                if (rnet_ring_get(&s->remote_rings[slot], hi, &newest))
+                    s->auth_last[slot] = newest;
+                resolved[slot] = s->auth_last[slot];
+            }
+            resolved[slot].size = per;
+            resolved[slot].tick = sim_tick;
+            resolved[slot].valid = 1;
+        }
+        memset(&row, 0, sizeof(row));
+        row.tick = sim_tick;
+        row.size = (rnet_u16)(1u + (unsigned)per * (unsigned)n);
+        row.bytes[0] = (rnet_u8)per;
+        for (slot = 0; slot < n; ++slot)
+            memcpy(row.bytes + 1 + (size_t)slot * per, resolved[slot].bytes, per);
+        row.valid = 1;
+        rnet_ring_store(&s->local_ring, &row);
+        send_input_bundle(s);
+    }
+    else
+    {
+        if (!s->is_observer)
+        {
+            rnet_u32 sample_wire = rnet_wire_tick_from_sim(sim_tick, s->delay);
+            if (!rnet_ring_get(&s->local_ring, sample_wire, &sample))
+            {
+                memset(&sample, 0, sizeof(sample));
+                s->host.sample_local(sim_tick, &sample, s->host.ctx);
+                sample.tick = sample_wire;
+                sample.valid = 1;
+                if (sample.size > RNET_INPUT_MAX)
+                    sample.size = RNET_INPUT_MAX;
+                rnet_ring_store(&s->local_ring, &sample);
+            }
+            send_input_bundle(s);
+        }
+        if (!rnet_ring_get(&s->remote_rings[0], sim_tick, &sample) ||
+            sample.size < 1)
+        {
+            note_admit_stall(s, RNET_ADMIT_WAIT_REMOTE_INPUT);
+            return 0;
+        }
+        {
+            const rnet_u16 per = sample.bytes[0];
+            if (sample.size != 1u + (unsigned)per * (unsigned)n)
+            {
+                note_admit_stall(s, RNET_ADMIT_DESYNC);
+                return 0;
+            }
+            for (slot = 0; slot < n; ++slot)
+            {
+                memcpy(resolved[slot].bytes, sample.bytes + 1 + (size_t)slot * per, per);
+                resolved[slot].size = per;
+                resolved[slot].tick = sim_tick;
+                resolved[slot].valid = 1;
+            }
+        }
+    }
+    s->host.publish(sim_tick, resolved, (int)n, s->host.ctx);
+    note_admit_ok(s);
+    return 1;
+}
+
 int rnet_session_try_admit(RNetSession *s, rnet_u32 sim_tick)
 {
     RNetInputSample resolved[RNET_MAX_SLOTS];
@@ -3314,6 +3422,9 @@ int rnet_session_try_admit(RNetSession *s, rnet_u32 sim_tick)
         note_admit_stall(s, RNET_ADMIT_DESYNC);
         return 0;
     }
+    if (s->cfg.host_authority &&
+        1u + 4u * (unsigned)s->cfg.slot_count <= RNET_INPUT_MAX)
+        return try_admit_host_authority(s, sim_tick);
 
     /* Simulate wire T while sampling local input for wire T+D. Once the
      * neutral prefix is consumed, peer input normally arrived D frames ago. */
