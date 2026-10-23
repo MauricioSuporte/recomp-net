@@ -97,6 +97,14 @@ int rnet_session_wait_recv(RNetSession *s, int timeout_ms);
  * wire=sim+D. Returns 0 to stall, including on input desync.
  */
 int rnet_session_try_admit(RNetSession *s, rnet_u32 sim_tick);
+/* Host-authority guest: sample the local pad again (host.sample_local) and,
+ * if it changed since the last input sent, send it now as the next tick
+ * instead of waiting for the host's row to admit the next sim tick. At most
+ * two inputs ahead of the sim tick. Safe to call on every pump: a guest only
+ * simulates the host's rows, so this never changes its own simulation.
+ * Returns 1 when an input was sent; 0 otherwise (and always off host
+ * authority, on the host and for observers). */
+int rnet_session_auth_refresh_local(RNetSession *s);
 
 /* Call after the host completes one authoritative sim step. */
 void rnet_session_advance(RNetSession *s);
@@ -244,6 +252,8 @@ typedef struct RNetSessionStats
      * the host's rows (how far that guest trails). Guest: its own backlog,
      * the host's newest row minus its sim tick. -1 when unknown. */
     int auth_backlog;
+    rnet_u32 auth_input_jumps; /* host: guest input queue jumped to newest */
+    rnet_u32 auth_presend;     /* guest: inputs sent ahead while waiting */
 } RNetSessionStats;
 
 void rnet_session_get_stats(const RNetSession *s, RNetSessionStats *out);

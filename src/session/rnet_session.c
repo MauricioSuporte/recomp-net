@@ -11,6 +11,12 @@
 #include <string.h>
 #include <stdio.h>
 
+/* Host authority: inputs a guest may send ahead of its sim tick while it
+ * waits for the host's row, and changes the host lets queue per guest before
+ * it jumps to the newest. */
+#define RNET_AUTH_PRESEND_MAX 2u
+#define RNET_AUTH_QUEUE_MAX 3u
+
 const char *rnet_version_string(void)
 {
     return "0.1.0";
@@ -126,6 +132,14 @@ struct RNetSession
     /* Host authority: the last input each seat contributed (repeated when
      * nothing newer has arrived). */
     RNetInputSample auth_last[RNET_MAX_SLOTS];
+    /* Host authority, host side: the guest tick last folded in per seat, so
+     * guest inputs are taken in the order they were sent (one change per
+     * tick) instead of only the newest, which dropped short taps whenever two
+     * inputs arrived together. */
+    rnet_u32 auth_cursor[RNET_MAX_SLOTS];
+    rnet_u8 auth_cursor_valid[RNET_MAX_SLOTS];
+    rnet_u32 auth_input_jumps; /* host: queues too deep, jumped to newest */
+    rnet_u32 auth_presend;     /* guest: inputs sent ahead of its sim tick */
     /* Host authority diagnostics: rows refused by the live window (a guest
      * further behind than one ring) and old rows resent from a peer's ACK. */
     rnet_u32 auth_rows_dropped;
@@ -2490,6 +2504,16 @@ static void send_input_bundle(RNetSession *s)
         return;
     }
     tip = rnet_wire_tick_from_sim(s->sim_tick, s->delay);
+    /* Host-authority guest: inputs refreshed while waiting for the host's
+     * row (rnet_session_auth_refresh_local) sit past the sim tip. */
+    if (s->cfg.host_authority && s->cfg.local_slot != 0)
+    {
+        RNetInputSample ahead;
+        rnet_u32 hi = rnet_ring_highest_valid(&s->local_ring);
+        if (hi > tip && hi <= tip + RNET_AUTH_PRESEND_MAX &&
+            rnet_ring_get(&s->local_ring, hi, &ahead))
+            tip = hi;
+    }
     /* A new future tip is latency-sensitive and sends immediately. Repeated
      * pumps for the same tip are reliability retransmits, not new data. */
     if (s->last_input_tip_valid && s->last_input_tip == tip &&
@@ -3380,6 +3404,82 @@ int rnet_session_wait_recv(RNetSession *s, int timeout_ms)
     return 0;
 }
 
+static int auth_same_input(const RNetInputSample *a, const RNetInputSample *b)
+{
+    return a->size == b->size && memcmp(a->bytes, b->bytes, a->size) == 0;
+}
+
+/* Host authority, host side: fold in a guest's next input.
+ *
+ * The guest sends one input per tick of its own. Taking only the newest
+ * (as before) lost every input that arrived in the same host tick as a newer
+ * one -- jitter, a resend burst, a guest catching up -- so a short tap could
+ * vanish. Inputs are taken in order instead, one change per host tick; runs
+ * of identical inputs collapse at once, so holding a button or idling never
+ * adds latency. If more than RNET_AUTH_QUEUE_MAX changes are waiting the
+ * host jumps to the newest, which bounds the extra delay of a burst. The
+ * host still never waits: with nothing new it repeats the last input. */
+static void auth_take_guest_input(RNetSession *s, rnet_u8 slot)
+{
+    RNetInputRing *ring = &s->remote_rings[slot];
+    RNetInputSample cand, prev, newest;
+    rnet_u32 hi = rnet_ring_highest_valid(ring);
+    rnet_u32 cur = s->auth_cursor[slot];
+    rnet_u32 t, pick = 0;
+    unsigned pending = 0;
+    int found = 0;
+
+    if (!rnet_ring_get(ring, hi, &newest))
+        return; /* nothing from this seat yet: keep auth_last */
+    if (!s->auth_cursor_valid[slot] || hi < cur ||
+        hi - cur > (rnet_u32)RNET_HISTORY_LENGTH / 2u)
+    {
+        /* First input, a new epoch (hard_resync restarts ticks) or a guest
+         * that fell out of the ring: start from the newest. */
+        s->auth_last[slot] = newest;
+        s->auth_cursor[slot] = hi;
+        s->auth_cursor_valid[slot] = 1;
+        return;
+    }
+    prev = s->auth_last[slot];
+    for (t = cur + 1u; t <= hi; ++t)
+    {
+        if (!rnet_ring_get(ring, t, &cand))
+            continue; /* a hole (lost datagram): never wait for it */
+        if (!found)
+        {
+            if (auth_same_input(&cand, &prev))
+            {
+                cur = t; /* no change: consume at once */
+                continue;
+            }
+            found = 1;
+            pick = t;
+            prev = cand;
+            continue;
+        }
+        if (!auth_same_input(&cand, &prev))
+        {
+            pending++;
+            prev = cand;
+        }
+    }
+    if (!found)
+    {
+        s->auth_cursor[slot] = hi;
+        return;
+    }
+    if (pending >= RNET_AUTH_QUEUE_MAX)
+    {
+        s->auth_input_jumps++;
+        s->auth_last[slot] = newest;
+        s->auth_cursor[slot] = hi;
+        return;
+    }
+    (void)rnet_ring_get(ring, pick, &s->auth_last[slot]);
+    s->auth_cursor[slot] = pick;
+}
+
 /* Host-authoritative admission (RNetConfig.host_authority). Seat 0 resolves
  * every tick from what it already has and never waits; everyone else plays
  * the rows it sends. Row layout in seat 0's sample: byte 0 = bytes per seat,
@@ -3407,10 +3507,7 @@ static int try_admit_host_authority(RNetSession *s, rnet_u32 sim_tick)
                 resolved[slot] = sample;
             else if (rnet_config_slot_occupied(&s->cfg, slot))
             {
-                RNetInputSample newest;
-                rnet_u32 hi = rnet_ring_highest_valid(&s->remote_rings[slot]);
-                if (rnet_ring_get(&s->remote_rings[slot], hi, &newest))
-                    s->auth_last[slot] = newest;
+                auth_take_guest_input(s, slot);
                 resolved[slot] = s->auth_last[slot];
             }
             resolved[slot].size = per;
@@ -3468,6 +3565,38 @@ static int try_admit_host_authority(RNetSession *s, rnet_u32 sim_tick)
     }
     s->host.publish(sim_tick, resolved, (int)n, s->host.ctx);
     note_admit_ok(s);
+    return 1;
+}
+
+int rnet_session_auth_refresh_local(RNetSession *s)
+{
+    RNetInputSample last, fresh;
+    rnet_u32 tip, hi;
+
+    if (s == NULL || s->phase != RNET_PHASE_RUNNING || !s->cfg.host_authority ||
+        s->cfg.local_slot == 0 || s->is_observer || s->state_stall_sim ||
+        s->input_send_suppress || s->input_desync)
+        return 0;
+    if (1u + 4u * (unsigned)s->cfg.slot_count > RNET_INPUT_MAX)
+        return 0; /* host authority not in effect (see try_admit) */
+    tip = rnet_wire_tick_from_sim(s->sim_tick, s->delay);
+    hi = rnet_ring_highest_valid(&s->local_ring);
+    /* Only once this tick's own input is out (try_admit samples it); never
+     * further ahead than RNET_AUTH_PRESEND_MAX. */
+    if (hi < tip || hi >= tip + RNET_AUTH_PRESEND_MAX ||
+        !rnet_ring_get(&s->local_ring, hi, &last))
+        return 0;
+    memset(&fresh, 0, sizeof(fresh));
+    s->host.sample_local(s->sim_tick, &fresh, s->host.ctx);
+    if (fresh.size > RNET_INPUT_MAX)
+        fresh.size = RNET_INPUT_MAX;
+    if (auth_same_input(&fresh, &last))
+        return 0;
+    fresh.tick = hi + 1u;
+    fresh.valid = 1;
+    rnet_ring_store(&s->local_ring, &fresh);
+    s->auth_presend++;
+    send_input_bundle(s);
     return 1;
 }
 
@@ -4160,6 +4289,8 @@ void rnet_session_get_stats(const RNetSession *s, RNetSessionStats *out)
     out->host_authority = s->cfg.host_authority ? 1 : 0;
     out->auth_rows_dropped = s->auth_rows_dropped;
     out->auth_resend_rows = s->auth_resend_rows;
+    out->auth_input_jumps = s->auth_input_jumps;
+    out->auth_presend = s->auth_presend;
     out->auth_backlog = -1;
     if (s->cfg.host_authority)
     {
@@ -4688,6 +4819,7 @@ void rnet_session_hard_resync(RNetSession *s)
         s->remote_contiguous_ack[i] = 0xffffffffu;
     memset(s->peer_ack_seen, 0, sizeof(s->peer_ack_seen));
     s->last_input_tip_valid = 0;
+    memset(s->auth_cursor_valid, 0, sizeof(s->auth_cursor_valid));
     /* Peers may have applied a load on different sim ticks; restart together. */
     s->sim_tick = 0;
     /* Invalidate in-flight INPUT/CONFIRM from the previous era (same low ticks
