@@ -4259,6 +4259,13 @@ void rnet_session_get_stats(const RNetSession *s, RNetSessionStats *out)
         int i;
         for (i = 0; i < RNET_MAX_SLOTS; ++i)
             out->peer_rx_age_ms[i] = rnet_session_peer_rx_age_ms(s, i);
+        for (i = 0; i < (int)s->cfg.slot_count && i < RNET_MAX_SLOTS; ++i)
+        {
+            if (s->peer_ready[i] || !rnet_config_slot_occupied(&s->cfg, (rnet_u8)i) ||
+                (!s->is_observer && i == (int)s->cfg.local_slot) ||
+                s->phase == RNET_PHASE_RUNNING)
+                out->ready_mask |= 1u << i;
+        }
     }
     out->packets_rx = s->packets_rx;
     out->input_bundle_sends = s->input_bundle_sends;

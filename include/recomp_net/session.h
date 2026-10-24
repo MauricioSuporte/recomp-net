@@ -254,6 +254,11 @@ typedef struct RNetSessionStats
     int auth_backlog;
     rnet_u32 auth_input_jumps; /* host: guest input queue jumped to newest */
     rnet_u32 auth_presend;     /* guest: inputs sent ahead while waiting */
+    /* Start rendezvous (appended): bit i = seat i has sent READY (or is this
+     * peer / an empty seat). Before RUNNING, an occupied seat missing here is
+     * the one the match is waiting on; peer_rx_age_ms says whether anything
+     * at all has arrived from it. */
+    rnet_u32 ready_mask;
 } RNetSessionStats;
 
 void rnet_session_get_stats(const RNetSession *s, RNetSessionStats *out);
