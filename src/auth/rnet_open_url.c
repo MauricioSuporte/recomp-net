@@ -9,6 +9,12 @@
 #include <windows.h>
 #include <shellapi.h>
 #else
+#if defined(__ANDROID__)
+#include <dlfcn.h>
+#ifndef RTLD_DEFAULT
+#define RTLD_DEFAULT ((void *)0)   /* bionic's value */
+#endif
+#endif
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -174,6 +180,16 @@ int rnet_open_url(const char *url) {
 #if defined(_WIN32)
     if ((INT_PTR)ShellExecuteA(NULL, "open", url, NULL, NULL, SW_SHOWNORMAL) > 32)
         return 1;
+#elif defined(__ANDROID__)
+    /* No xdg-open on Android: hand the URL to the system browser through
+     * SDL's Java glue (an ACTION_VIEW intent). SDL is already loaded by the
+     * host; resolve it at run time so this library keeps no SDL dependency. */
+    {
+        typedef int (*OpenUrlFn)(const char *);
+        OpenUrlFn open_url = (OpenUrlFn)dlsym(RTLD_DEFAULT, "SDL_OpenURL");
+        if (open_url && open_url(url) == 0) return 1;
+        goto fail;
+    }
 #else
     {
         char opener[4096];
